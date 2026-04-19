@@ -1,0 +1,132 @@
+Here is a detailed explanation of how thread creation and context switching operate in this specific lab.
+
+Phase 1: Modifying the Data Structures
+
+Before creating or switching threads, you must define what needs to be saved. When a thread pauses, it needs to 
+remember where it was executing and what its local variables were.
+
+You do this by adding a struct context inside the struct thread in user/uthread.c. 
+It only needs to store the callee-saved registers in RISC-V:
+
+- ra (Return Address): Where the thread should resume executing.
+- sp (Stack Pointer): Where the thread's stack is.
+- s0 to s11: Saved registers used by C functions.
+
+// Concept of what you add to uthread.c
+struct context {
+  uint64 ra;
+  uint64 sp;
+  uint64 s0;
+  // ... s1 through s11
+};
+
+struct thread {
+  char       stack[STACK_SIZE]; /* the thread's stack */
+  int        state;             /* FREE, RUNNING, RUNNABLE */
+  struct context context;       /* SAVED REGISTERS */
+};
+
+Phase 2: Creating a Thread (thread_create)
+
+The thread_create(void (*func)()) function is responsible for setting up a brand new thread so that the first time it is scheduled, 
+it starts running the function func.
+
+Here is the sequence of operations:
+
+1. Find a slot: It searches the all_thread array for a thread with the state FREE.
+2. Set State: It changes the state to RUNNABLE.
+3. Initialize the Stack Pointer (sp): In RISC-V, stacks grow downwards. 
+Therefore, the stack pointer must be set to the top (highest memory address) of the thread's allocated stack array.
+
+t->context.sp = (uint64)t->stack + STACK_SIZE;
+
+4. Initialize the Return Address (ra): 
+When thread_switch finishes, it calls the assembly instruction ret. 
+ret jumps to the address stored in the ra register. 
+Therefore, to make the thread start executing func, you must set ra to func.
+
+t->context.ra = (uint64)func;
+
+(Note: The s0-s11 registers can remain uninitialized because this is a brand new thread with no prior state).
+
+Phase 3: Context Switching (thread_schedule & thread_switch.S)
+
+Context switching happens when a running thread calls thread_yield(), which in turn calls thread_schedule().
+
+1. The Coordinator: thread_schedule()
+
+This C function decides which thread runs next.
+
+- It finds the next RUNNABLE thread in the array.
+
+- It marks the currently running thread as RUNNABLE (so it can run again later).
+
+- It marks the next thread as RUNNING.
+
+- It calls the assembly function: thread_switch((uint64)&current_thread->context, (uint64)&next_thread->context);
+
+2. The Mechanics: thread_switch.S
+
+This is where the actual magic happens. thread_switch is written in assembly. 
+Because it is called as a C function, RISC-V ABI rules dictate that the first argument 
+(&current_thread->context) is passed in register a0, and the second (&next_thread->context) is in register a1.
+
+The assembly code performs three exact steps:
+
+Step A: Save the old thread's context
+It stores the current CPU registers into the memory address pointed to by a0.
+
+sd ra, 0(a0)    # Save Return Address
+sd sp, 8(a0)    # Save Stack Pointer
+sd s0, 16(a0)   # Save s0
+# ... save s1 to s11 ...
+
+Step B: Restore the new thread's context
+It loads the CPU registers from the memory address pointed to by a1.
+
+ld ra, 0(a1)    # Load new Return Address
+ld sp, 8(a1)    # Load new Stack Pointer
+ld s0, 16(a1)   # Load new s0
+# ... load s1 to s11 ...
+
+Step C: The Jump (ret)
+
+ret
+
+The ret instruction simply tells the CPU: "Look at the ra register, and jump to whatever memory address is stored there."
+
+Why does this work?
+
+If switching to an existing thread: The ra register was saved exactly where the thread previously called thread_switch. 
+When ret is called, the thread wakes up exactly as if thread_switch just returned normally.
+
+If switching to a brand new thread: The ra register was artificially set to func during thread_create,
+and sp was set to the top of the new stack. When ret is called, the CPU jumps to the beginning of func, 
+and it starts using its own isolated stack!
+
+Why only Callee-Saved Registers?
+
+The lab hints: "thread_switch needs to save/restore only the callee-save registers. Why?"
+Because thread_switch is a standard C function call. In C (under RISC-V calling conventions), 
+if the caller (the function calling thread_schedule) cares about caller-saved registers (like t0-t6, a0-a7), 
+the C compiler automatically generated assembly code to save those on the stack before calling thread_switch. 
+Therefore, the threading library only needs to manually save the callee-saved registers (s0-s11, sp, ra).
+
+
+~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Part 2: Answering the Question
+The Question: The breakpoint [at uthread.c:60] may (or may not) be triggered before you even run uthread. How could that happen?
+The Answer:
+This happens because of how Virtual Memory and User Space work in xv6.
+1. Address Overlap: Every user process in xv6 (like init, sh (the shell), and your uthread program) starts its memory layout 
+at the same virtual address (usually address 0x0).
+2. GDB's Perspective: When you type file user/_uthread and set a breakpoint at a specific line, GDB looks up the virtual address
+ of that line (e.g., 0x12a). It then tells the emulator (QEMU): "Stop the CPU whenever it tries to execute an instruction at 
+ address 0x12a."
+3. The Conflict: Before you even type uthread in the shell, xv6 is already running the init process and the sh process. 
+If the sh (shell) program happens to have some code at virtual address 0x12a, the CPU will hit that address while just 
+trying to display the command prompt.
+4. The Result: QEMU doesn't know that address 0x12a "belongs" to uthread. It just knows the CPU hit that address. 
+So it pauses and tells GDB, which triggers your breakpoint—even though you are currently inside the shell, not your uthread program.
+Summary: Multiple processes use the same virtual address space. GDB triggers based on the address, not the process identity.
