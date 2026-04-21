@@ -1,0 +1,13 @@
+Explanation for missing keys in ph.c with 2 threads:
+
+When two threads concurrently call `put()` to insert new keys that hash to the same bucket (index `i`), a race condition occurs. Here is a sequence of events that leads to a missing key:
+
+1. Thread A computes the bucket index `i` for Key A, traverses the linked list, and finds that Key A is not present.
+2. Context switch to Thread B.
+3. Thread B computes the exact same bucket index `i` for a different Key B, traverses the list, and finds that Key B is also not present.
+4. Thread A allocates a new entry for Key A, sets its `next` pointer to the current head of the bucket (`table[i]`).
+5. Thread B allocates a new entry for Key B, and also sets its `next` pointer to the current head of the bucket (`table[i]`).
+6. Thread A updates the bucket head (`table[i]`) to point to its new entry for Key A.
+7. Thread B updates the bucket head (`table[i]`) to point to its new entry for Key B, completely overwriting Thread A's update.
+
+As a result, the entry created by Thread A is detached from the linked list, making Key A "missing" during the get phase. This doesn't happen with 1 thread because operations are strictly sequential.
